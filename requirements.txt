@@ -1,0 +1,15 @@
+# Core Dependencies
+numpy==1.26.4
+opencv-python==4.7.0.72
+opencv-python-headless==4.9.0.80
+torch==2.2.2
+torchvision==0.17.2
+
+# Pip-only Dependencies
+pytorch-ignite==0.5.1
+tensorboard==2.18.0
+albumentations==1.3.0
+yapf==0.31.0
+pytest==6.2.5
+labelme==5.5.0
+bm3d==3.0.9
