@@ -2,12 +2,10 @@ import base64
 import json
 import logging
 import pathlib
-
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
 from cbm3d_denoise import cbm3d_denoise
 from .transforms import get_transforms
 

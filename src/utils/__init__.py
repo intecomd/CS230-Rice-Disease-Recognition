@@ -5,5 +5,7 @@ from .engine import attach_training_logger
 from .engine import attach_model_checkpoint
 from .engine import attach_metric_logger
 from .evaluation import AverageLoss
+from .evaluation import MeanAveragePrecision
+from .evaluation import MeanIoU
 from .visualization import visualize_results
 from .utility import create_data_loaders

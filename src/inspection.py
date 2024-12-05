@@ -1,8 +1,6 @@
 import argparse
 import logging
-
 import cv2
-
 from datasets import LabelMeDataset
 from utils import visualize_results
 

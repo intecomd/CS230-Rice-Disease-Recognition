@@ -1,11 +1,9 @@
 import argparse
 import logging
 import pathlib
-
 import cv2
 import torch
 from torchvision import transforms
-
 from models import MaskRCNN, filter_by_threshold
 from utils import visualize_results
 from cbm3d_denoise import cbm3d_denoise

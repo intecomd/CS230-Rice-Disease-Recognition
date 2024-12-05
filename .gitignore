@@ -2,4 +2,4 @@
 __pycache__/
 venv/
 src/logs/
-trained/model_mask_rcnn_rice_disease_10_10.pt
+.python-version

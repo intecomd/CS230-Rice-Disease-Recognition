@@ -1,6 +1,5 @@
 import argparse
 import logging
-
 import torch
 from torch import nn, optim
 from torch.utils import tensorboard
@@ -9,8 +8,8 @@ from utils import (
     create_trainer, create_evaluator, attach_lr_scheduler,
     attach_training_logger, attach_metric_logger, attach_model_checkpoint, create_data_loaders
 )
-from utils import AverageLoss
-from models import MaskRCNN
+from utils import AverageLoss, MeanAveragePrecision, MeanIoU
+from models import get_instance_segmentation_model, MaskRCNN
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Train Mask-RCNN for Rice Disease Identification")
@@ -28,7 +27,15 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='%(asctime)s %(levelname)s:%(message)s',
+        handlers=[
+            logging.FileHandler(f"{args.model_tag}_training.log"),
+            logging.StreamHandler()
+        ]
+    )
+
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     logging.info(f'Running training on {device}')
 
@@ -52,27 +59,64 @@ def main():
         logging.info(f"Validation Batch - Images: {len(images)}, Targets: {len(targets)}")
         break
 
-    # Initialize model, optimizer, and scheduler
-    model = MaskRCNN(train_dataset.categories)
+    num_classes = len(train_dataset.categories)
+
+    # Initialize MaskRCNN model
+    # model = MaskRCNN(train_dataset.categories)
+
+    # Initialize MaskRCNN-CBAM model
+    model = get_instance_segmentation_model(num_classes)
+
     model = nn.DataParallel(model).to(device)
-    optimizer = optim.RMSprop(filter(lambda p: p.requires_grad, model.parameters()), lr=args.initial_lr)
+
+    # Adjust the initial learning rate for SGD (Adjusted based on batch size)
+    args.initial_lr = 0.005  
+
+    # Initialize optimizer and scheduler with SGD and momentum
+    optimizer = optim.SGD(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.initial_lr,
+        momentum=0.9,
+        weight_decay=0.0005,
+    )
+
+    # Use ExponentialLR scheduler
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
     start_epoch = 1
 
-    # Load checkpoint if resuming training
     if args.checkpoint and args.resume:
         logging.info(f'Loading checkpoint from {args.checkpoint}')
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
+
+        model_state_dict = checkpoint
+
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(model_state_dict)
+        else:
+            model.load_state_dict(model_state_dict)
+
+        # Re-initialize optimizer and scheduler
+        optimizer = optim.SGD(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.initial_lr,
+            momentum=0.9,
+            weight_decay=0.0005,
+        )
+        lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
+        # Set the starting epoch or set manually if known
+        start_epoch = 1
         logging.info(f'Resumed training from epoch {start_epoch}')
 
     trainer = create_trainer(model, optimizer, device=device)
+
     evaluator = create_evaluator(
-        model, metrics={'average_losses': AverageLoss(device=device)}, device=device, non_blocking=True
+        model, metrics={
+            'average_losses': AverageLoss(device=device),
+            'mean_precision': MeanAveragePrecision(device=device),
+            'mean_iou': MeanIoU(class_metrics=True, device=device)
+        }, device=device, non_blocking=True
     )
 
     writer = tensorboard.SummaryWriter(log_dir=f'logs/{args.model_tag}')
@@ -82,12 +126,22 @@ def main():
     attach_training_logger(trainer, writer)
     attach_metric_logger(trainer, evaluator, 'train', train_metrics_loader, writer)
     attach_metric_logger(trainer, evaluator, 'val', val_loader, writer)
-    attach_model_checkpoint(trainer, {'model': model.module})
+    attach_model_checkpoint(trainer, model, optimizer, lr_scheduler, args)
 
     logging.info('Starting training...')
-    trainer.run(train_loader, max_epochs=args.num_epochs, epoch_length=len(train_loader))
 
-    torch.save(model.module.state_dict(), f'{args.model_tag}_final.pth')
+    # Calculate total epochs to run
+    total_epochs = start_epoch + args.num_epochs - 1
+
+    trainer.run(train_loader, max_epochs=total_epochs)
+
+    # Save final checkpoint
+    torch.save({
+        'epoch': total_epochs,
+        'model_state_dict': model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'lr_scheduler_state_dict': lr_scheduler.state_dict(),
+    }, f'{args.model_tag}_final.pth')
 
     writer.close()
 

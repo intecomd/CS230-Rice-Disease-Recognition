@@ -1,6 +1,5 @@
 import logging
 from typing import Dict
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,16 +9,24 @@ from ignite import engine
 from ignite import metrics
 from ignite import handlers
 from torch.utils.data import DataLoader
+from ignite.handlers import ModelCheckpoint
+from ignite.engine import Events
 
 # Define collate_fn at the top level
 def collate_fn(batch):
     return tuple(zip(*batch))
 
+def prepare_batch(batch, device=None, non_blocking=False):
+    images, targets = batch
+    images = [img.to(device=device, non_blocking=non_blocking) for img in images]
+    targets = [{k: v.to(device=device, non_blocking=non_blocking) for k, v in t.items()} for t in targets]
+    return images, targets
+
 def create_trainer(model: nn.Module, optimizer: optim.Optimizer, device=None, non_blocking: bool = False):
     if device:
         model.to(device)
 
-    fn_prepare_batch = lambda batch: engine._prepare_batch(batch, device=device, non_blocking=non_blocking)
+    fn_prepare_batch = lambda batch: prepare_batch(batch, device=device, non_blocking=non_blocking)
 
     def _update(engine, batch):
         model.train()
@@ -43,19 +50,33 @@ def create_evaluator(model: nn.Module, metrics: Dict[str, metrics.Metric], devic
     if device:
         model.to(device)
 
-    fn_prepare_batch = lambda batch: engine._prepare_batch(batch, device=device, non_blocking=non_blocking)
+    fn_prepare_batch = lambda batch: prepare_batch(batch, device=device, non_blocking=non_blocking)
 
-    def _update(engine, batch):
+    def _inference(engine, batch):
+        images, targets = fn_prepare_batch(batch)
+
+        # Compute predictions in evaluation mode
+        model.eval()
         with torch.no_grad():
-            images, targets = fn_prepare_batch(batch)
-            losses = model(images, targets)
-            loss = sum(losses.values())
-            losses = {k: v.item() for k, v in losses.items()}
-            losses['loss'] = loss.item()
-            batch_size = len(images)
-        return losses, batch_size
+            outputs = model(images)
 
-    evaluator = engine.Engine(_update)
+        # Compute losses in training mode
+        model.train()
+        with torch.no_grad():
+            losses = model(images, targets)
+            if isinstance(losses, dict):
+                loss = sum(losses.values())
+                losses = {k: v.item() for k, v in losses.items()}
+                losses['loss'] = loss.item()
+            else:
+                losses = {'loss': losses.item()}
+
+        # Return the model to evaluation mode
+        model.eval()
+
+        return outputs, targets, losses
+
+    evaluator = engine.Engine(_inference)
 
     for name, metric in metrics.items():
         metric.attach(evaluator, name)
@@ -109,34 +130,57 @@ def attach_metric_logger(
     def log_metrics(engine):
         evaluator.run(data_loader)
 
-        def _to_message(metrics):
-            message = ''
+        metrics = evaluator.state.metrics
 
-            for metric_name, metric_value in metrics.items():
-                if isinstance(metric_value, dict):
-                    message += _to_message(metric_value)
+        # Handle Average Losses separately
+        if 'average_losses' in metrics:
+            losses = metrics.pop('average_losses')
+            for key, value in losses.items():
+                writer.add_scalar(f'{data_name}/mean_{key}', value, engine.state.epoch)
+
+        # Flatten and log other metrics
+        def _flatten_metrics(metrics, parent_key='', sep='/'):
+            items = []
+            for k, v in metrics.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.extend(_flatten_metrics(v, new_key, sep=sep).items())
+                elif isinstance(v, torch.Tensor):
+                    if v.numel() == 1:
+                        items.append((new_key, v.item()))
+                    else:
+                        for idx, val in enumerate(v):
+                            items.append((f"{new_key}/class_{idx}", val.item()))
                 else:
-                    writer.add_scalar(f'{data_name}/mean_{metric_name}', metric_value, engine.state.epoch)
-                    message += f'{metric_name}: {metric_value:.3f} '
+                    items.append((new_key, v))
+            return dict(items)
 
-            return message
+        flat_metrics = _flatten_metrics(metrics)
+        message = ''
+        for metric_name, metric_value in flat_metrics.items():
+            writer.add_scalar(f'{data_name}/{metric_name}', metric_value, engine.state.epoch)
+            message += f'{metric_name}: {metric_value:.3f} '
 
-        message = _to_message(evaluator.state.metrics)
         logging.info(message)
 
-def attach_model_checkpoint(trainer: engine.Engine, models: Dict[str, nn.Module]):
-    def to_epoch(trainer: engine.Engine, event_name: str):
+def attach_model_checkpoint(trainer, model, optimizer, lr_scheduler, args):
+    def global_step_transform(engine, event_name):
         return trainer.state.epoch
 
-    handler = handlers.ModelCheckpoint(
-        './models',
-        'model',
+    handler = ModelCheckpoint(
+        dirname='models',
+        filename_prefix=args.model_tag,
+        n_saved=5,
         create_dir=True,
         require_empty=False,
-        n_saved=None,
-        global_step_transform=to_epoch,
+        global_step_transform=global_step_transform,
     )
-    trainer.add_event_handler(engine.Events.EPOCH_COMPLETED, handler, models)
+    to_save = {
+        'model': model.module if hasattr(model, 'module') else model,
+        'optimizer': optimizer,
+        'lr_scheduler': lr_scheduler,
+    }
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, handler, to_save)
 
 def create_data_loaders(train_dataset, val_dataset, num_workers, batch_size):
     # Use the top-level collate_fn
